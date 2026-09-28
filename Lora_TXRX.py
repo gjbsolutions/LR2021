@@ -17,7 +17,7 @@ Changes in this version:
      combination in the datasheet. The code keeps the 10 dBm duty/slices
      and steps tx_power down by 0.5 dB/LSB (Table 7-23). The resulting
      output is an estimate -- measure it if the exact level matters.
-  3. Earlier fixes retained: CALIB_AAF = bit 4 (Table 6-28), and
+  3. Earlier fixes retained: CALIB_AAF = bit 3 (Table 6-28), and
      tx_power register range clamp per Table 7-23.
 """
 
@@ -77,8 +77,8 @@ IRQ_ADDR_ERROR       = (1 << 24)
 CALIB_LF_RC  = (1 << 0)
 CALIB_HF_RC  = (1 << 1)
 CALIB_PLL    = (1 << 2)
-# bit 3 is RFU. AAF is bit 4.
-CALIB_AAF    = (1 << 4)
+# bit 4 is RFU. AAF is bit 3.
+CALIB_AAF    = (1 << 3)
 CALIB_MU     = (1 << 5)
 CALIB_PA_OFF = (1 << 6)
 CALIB_ALL    = CALIB_LF_RC | CALIB_HF_RC | CALIB_PLL | CALIB_AAF | CALIB_MU | CALIB_PA_OFF
