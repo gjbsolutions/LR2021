@@ -6,6 +6,19 @@ RX side: prints every received packet to the console.
 
 Edit ROLE below to switch between 'TX' and 'RX'.
 
+Changes in this version:
+  1. TX power now uses the datasheet's optimal PA tables
+     (Table 7-19 for 915 MHz reference design, used for >= 800 MHz, and
+     Table 7-20 for 490 MHz reference design, used for < 800 MHz).
+     Each table row gives a matched (tx_power, pa_lf_duty_cycle,
+     pa_lf_slices) triple. All three must be applied together; tx_power
+     alone does NOT give the targeted output power.
+  2. Below 10 dBm (lowest table entry) there is no characterised
+     combination in the datasheet. The code keeps the 10 dBm duty/slices
+     and steps tx_power down by 0.5 dB/LSB (Table 7-23). The resulting
+     output is an estimate -- measure it if the exact level matters.
+  3. Earlier fixes retained: CALIB_AAF = bit 4 (Table 6-28), and
+     tx_power register range clamp per Table 7-23.
 """
 
 from machine import SPI, Pin
@@ -21,7 +34,7 @@ BW           = 0x4           # 125 kHz
 CR           = 0x1           # 4/5
 LDRO         = 0x0           # 0 for SF7/BW125
 SYNCWORD     = 0x12          # 0x12 = private, 0x34 = public LoRaWAN
-TX_POWER_DBM = 2
+TX_POWER_DBM = 14            # 10..22 dBm uses datasheet tables; <10 is estimated
 INTERVAL_MS  = 2000          # TX interval
 USE_TCXO     = False         # True if your board has a TCXO on XTA
 TCXO_VOLTAGE = 0x02          # 1.8 V (only used if USE_TCXO=True)
@@ -64,7 +77,7 @@ IRQ_ADDR_ERROR       = (1 << 24)
 CALIB_LF_RC  = (1 << 0)
 CALIB_HF_RC  = (1 << 1)
 CALIB_PLL    = (1 << 2)
-# NOTE: bit 3 is RFU. AAF is bit 4 (was incorrectly (1 << 3) before).
+# bit 3 is RFU. AAF is bit 4.
 CALIB_AAF    = (1 << 4)
 CALIB_MU     = (1 << 5)
 CALIB_PA_OFF = (1 << 6)
@@ -224,6 +237,7 @@ def set_packet_type_lora():
     _cmd_write(0x02, 0x07, [0x00])
 
 def set_pa_config(pa_sel=0, pa_lf_mode=0, duty=4, slices=4, hf_duty=16):
+    # Table 7-18: byte2 = pa_sel(bit7) | rfu(bits6:2) | pa_lf_mode(bits1:0)
     b2 = ((pa_sel & 0x01) << 7) | (pa_lf_mode & 0x03)
     b3 = ((duty & 0x0F) << 4) | (slices & 0x0F)
     b4 = hf_duty & 0x1F
@@ -234,15 +248,55 @@ def set_tx_params(raw, ramp=0x04):
         raw = 0x100 + raw
     _cmd_write(0x02, 0x03, [raw & 0xFF, ramp & 0xFF])
 
-def set_tx_power_dbm(dbm, ramp=0x04, pa_sel=0):
-    # LR2021 datasheet Table 7-23 (SetTxParams): tx_power is +0.5 dB/LSB,
-    # with NO additive offset:
-    #   PA_LF: register [-19:44]  <-> output [-9.5:22] dBm
-    #   PA_HF: register [-39:24]  <-> output [-19.5:12] dBm
-    # i.e. tx_power = round(dBm * 2) for both PAs.
-    raw = round(dbm * 2)
-    raw = max(-19, min(44, raw)) if pa_sel == 0 else max(-39, min(24, raw))
+# ------------------------------------------------------------------------------
+# PA optimal values, Semtech reference design
+#   target dBm : (TX_POWER register, PA_LF_DUTY_CYCLE, PA_LF_SLICES)
+# ------------------------------------------------------------------------------
+PA_TABLE_915 = {   # Table 7-19 (used here for >= 800 MHz, incl. 868 MHz)
+    22.0:(22,7,7), 21.5:(22,6,7), 21.0:(22,5,6), 20.5:(21,6,7),
+    20.0:(21,5,6), 19.5:(21,4,7), 19.0:(20,5,7), 18.5:(20,4,7),
+    18.0:(19,5,7), 17.5:(19,5,4), 17.0:(18,7,3), 16.5:(18,5,4),
+    16.0:(17,7,3), 15.5:(18,4,3), 15.0:(17,4,5), 14.5:(17,4,3),
+    14.0:(17,4,2), 13.5:(16,4,3), 13.0:(16,4,2), 12.5:(15,5,2),
+    12.0:(15,4,2), 11.5:(14,5,2), 11.0:(15,2,4), 10.5:(17,4,0),
+    10.0:(16,1,2),
+}
+PA_TABLE_490 = {   # Table 7-20 (used here for < 800 MHz)
+    21.0:(22,7,7), 20.5:(22,7,4), 20.0:(21,7,7), 19.5:(21,7,4),
+    19.0:(20,7,6), 18.5:(22,6,2), 18.0:(19,7,6), 17.5:(19,7,3),
+    17.0:(19,6,5), 16.5:(18,6,7), 16.0:(18,6,5), 15.5:(17,6,7),
+    15.0:(16,7,5), 14.5:(16,6,7), 14.0:(15,7,5), 13.5:(15,7,3),
+    13.0:(15,7,2), 12.5:(15,6,3), 12.0:(15,6,2), 11.5:(15,5,3),
+    11.0:(15,4,5), 10.5:(17,6,0), 10.0:(15,5,1),
+}
+
+def set_tx_power(dbm, ramp=0x04, freq_hz=None):
+    """
+    Program PA_LF for the requested output power.
+    Returns (effective_dbm, characterised) where `characterised` is False
+    if the value is outside the datasheet tables (estimate only).
+    """
+    if freq_hz is None:
+        freq_hz = FREQ_HZ
+    table = PA_TABLE_490 if freq_hz < 800_000_000 else PA_TABLE_915
+    lo = min(table)
+    hi = max(table)
+
+    if dbm >= lo:
+        target = min(table, key=lambda x: abs(x - min(dbm, hi)))
+        raw, duty, slices = table[target]
+        set_pa_config(pa_sel=0, pa_lf_mode=0, duty=duty, slices=slices)
+        set_tx_params(raw, ramp)
+        return target, True
+
+    # Below the lowest table entry: keep the lowest entry's duty/slices and
+    # step tx_power down at 0.5 dB per LSB (Table 7-23). Not characterised.
+    base_raw, duty, slices = table[lo]
+    raw = base_raw + round((dbm - lo) * 2)
+    raw = max(-19, min(44, raw))       # PA_LF register range
+    set_pa_config(pa_sel=0, pa_lf_mode=0, duty=duty, slices=slices)
     set_tx_params(raw, ramp)
+    return dbm, False
 
 # ==============================================================================
 # LoRa MODEM
@@ -353,9 +407,6 @@ def lora_init(freq_hz=FREQ_HZ, use_tcxo=USE_TCXO,
 def lora_tx_once(payload, irq_dio=9):
     set_lora_modulation(sf=SF, bw=BW, cr=CR, ldro=LDRO)
     set_lora_packet_params(pbl=8, pld=len(payload), hdr=0, crc=1, inv=0)
-    set_pa_config(pa_sel=0, pa_lf_mode=0,
-                  duty=4, slices=2, hf_duty=16)
-    set_tx_power_dbm(TX_POWER_DBM, pa_sel=0)
     set_lora_syncword(SYNCWORD)
     configure_irq_pin(dio=irq_dio, mask=IRQ_TX_DONE | IRQ_TIMEOUT)
 
@@ -418,6 +469,14 @@ def lora_rx_once(irq_dio=9, timeout=0x000000):
 # ==============================================================================
 def run_tx():
     print("[TX] Starting transmitter loop")
+    # PA settings are static, so configure once before the loop.
+    eff_dbm, characterised = set_tx_power(TX_POWER_DBM)
+    if characterised:
+        print(f"[TX] PA set for {eff_dbm} dBm (datasheet table values)")
+    else:
+        print(f"[TX] WARNING: {TX_POWER_DBM} dBm is below the datasheet tables "
+              f"(min 10 dBm). PA setting is an estimate; measure real output.")
+
     counter = 0
     while True:
         msg = f"Hello World! {counter}".encode()
@@ -445,8 +504,6 @@ def run_rx():
                   f"foff={stats['foff']} Hz, "
                   f"len={stats['len']})")
         else:
-            # Silence timeouts (single-Rx mode with no timeout never times out,
-            # but keep the branch for safety).
             if status != "timeout":
                 print(f"[RX] No packet ({status})")
 
@@ -460,4 +517,3 @@ if __name__ == "__main__":
         run_tx()
     else:
         run_rx()
-
